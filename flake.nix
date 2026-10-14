@@ -4,12 +4,15 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
-    
+
+    #beef-src = {
+    #  url = "path:/home/vendinois/Projects/Beef/Beef";
+    #  flake = false;
+    #};
+
+
     beef-src = {
-      url = "github:beefytech/Beef/7e5c38a4374c1c16c065c60f795ca81eddb3d303";
-      
-      # Use an absolute path to your own fork of Beef if you want to use this flake to build it.
-      # url = "path:/path/to/the/forked/Beef";
+      url = "github:beefytech/Beef/e2de45345f3ab782a61faacd9384c8b600db5f80";
       flake = false;
     };
   };
@@ -20,24 +23,10 @@
         pkgs = import nixpkgs { inherit system; };
         lib = pkgs.lib;
 
-        # Wayland compositors where SDL must use its native Wayland driver rather
-        # than fall back to XWayland (which lags BeefIDE's SDL popups). Entries are
-        # matched case-insensitively against the colon-separated
-        # XDG_CURRENT_DESKTOP / XDG_SESSION_DESKTOP values, so keep them lowercase.
-        # To add a compositor, append its name here.
-        waylandOnlyCompositors = [ "cosmic" "umbriel" ];
-
-        # Bash `case` alternation matching whole colon-delimited tokens, e.g.
-        # `*:cosmic:* | *:umbriel:*`.
-        waylandCompositorPattern = lib.concatMapStringsSep " | "
-          (name: "*:${name}:*")
-          waylandOnlyCompositors;
-
         llvmPkgs = pkgs.llvmPackages_22 or pkgs.llvmPackages_latest;
 
         ideRuntimeDeps = with pkgs; [
           sdl3
-          sdl3-ttf
           systemd
           curl
           freetype
@@ -75,19 +64,13 @@
           llvmPkgs.llvm.lib
           llvmPkgs.lldb.dev
           llvmPkgs.lldb
+          llvmPkgs.clang
+          llvmPkgs.lld
           libffi
           zlib
           libxml2
           ncurses
         ];
-
-        # LLVM toolchain tools (clang++, ld.lld, llvm-ar) that Beef's IDE /
-        # BeefBuild resolve from PATH at link time when the LLVM toolset is
-        # selected. These are added to the wrapper PATH below (NOT to
-        # buildInputs): clang-wrapper is itself a cc-wrapper, and adding it to
-        # buildInputs disrupts the bootstrapped BeefBuild's rpath resolution of
-        # libLLVM.so during the build phase. Nix's reference scanner pulls them
-        # into the output closure via the wrapper script regardless.
 
         # Desktop entry for the app launcher. Upstream ships
         # IDE/Resources/BeefIDE.desktop but it targets the /opt/BeefLang
@@ -129,7 +112,19 @@
           '';
 
           postPatch = ''
-            patchShebangs BeefySysLib/third_party/libffi || true
+            patchShebangs bin BeefySysLib/third_party/libffi || true
+            # Relax LLVM version pin if nixpkgs ships a different 22.x minor.
+            if [ -f CMakeLists.txt ]; then
+              substituteInPlace CMakeLists.txt \
+                --replace-quiet 'find_package(LLVM 22.1' 'find_package(LLVM 22'
+            fi
+
+            # The pinned Beef commit doesn't wire BeefTools/ImgCreate into the
+            # top-level CMakeLists.txt, so -DBUILD_IMGCREATE is silently ignored.
+            # Add it ourselves; the subproject's own CMakeLists exists.
+            if ! grep -q 'BeefTools/ImgCreate' CMakeLists.txt; then
+              printf '\nadd_subdirectory(BeefTools/ImgCreate)\n' >> CMakeLists.txt
+            fi
           '';
 
           buildPhase = ''
@@ -141,6 +136,8 @@
             # 1. Bundled libffi (matches build.sh behavior).
             (
               cd BeefySysLib/third_party/libffi
+              export CC=clang
+              export CXX=clang++
               ./configure --disable-docs
               make -j$NIX_BUILD_CORES
             )
@@ -183,16 +180,6 @@
             # sandbox sets HOME=/homeless-shelter which is not writable.
             export HOME=$TMPDIR
 
-            # BeefBoot's DoLinkGNU scans $PATH for `c++` and keeps the LAST
-            # match, which would pick the unwrapped gcc over the cc-wrapper and
-            # lose the glibc -B flag (ld can't find crt1.o). Append a `c++`
-            # symlink to the cc-wrapper at the END of PATH so the scan resolves
-            # the wrapper. BuildContext.bf uses a first-match scan, which already
-            # resolves the wrapper, so this does not disturb it.
-            mkdir -p "$TMPDIR/beef-cxx"
-            ln -sfn ${pkgs.stdenv.cc}/bin/c++ "$TMPDIR/beef-cxx/c++"
-            export PATH="$PATH:$TMPDIR/beef-cxx"
-
             # 4. Bootstrap BeefBuild via BeefBoot.
             echo "Building BeefBuild_boot..."
             $ROOT/jbuild/Release/bin/BeefBoot \
@@ -211,6 +198,7 @@
 
             # 5. Build BeefIDE with the freshly-built BeefBuild.
             echo "Building BeefIDE (Release)..."
+            export LD_LIBRARY_PATH="${llvmPkgs.llvm.lib}/lib:${llvmPkgs.lldb}/lib:${pkgs.stdenv.cc.cc.lib}/lib:$LD_LIBRARY_PATH"
             ./BeefBuild -clean -proddir=../ -config=Release -define=LINUX_PACKAGE
 
             # ImgCreate's CMakeLists uses EXECUTABLE_OUTPUT_PATH which Ninja
@@ -272,71 +260,35 @@
 
             libpath="${lib.makeLibraryPath ideRuntimeDeps}"
             makeWrapper $share/bin/BeefBuild $out/bin/BeefBuild \
-              --prefix LD_LIBRARY_PATH : "$libpath" \
-              --prefix LIBRARY_PATH : "$libpath" \
-              --prefix PATH : "${llvmPkgs.clang}/bin" \
-              --prefix PATH : "${llvmPkgs.lld}/bin" \
-              --prefix PATH : "${llvmPkgs.llvm}/bin" \
-              --prefix PATH : "${pkgs.stdenv.cc}/bin"
+              --prefix LD_LIBRARY_PATH : "$libpath"
             # BeefIDE writes DefaultLayout.toml relative to its own binary
             # (/proc/self/exe resolves symlinks, so only the binary itself must
             # be a real copy in a user-writable dir; everything else symlinks).
-            
-            # Use Nix interpolation ${placeholder "out"} to inject the store path,
-            # and use a QUOTED heredoc delimiter 'LAUNCHER_SCRIPT' so bash does
-            # NOT expand $variables at build time. Runtime variables like
-            # ''${XDG_CURRENT_DESKTOP:-} survive literally into the file and are
-            # expanded when the launcher runs.
-            cat > $share/bin/beef-ide-launcher << 'LAUNCHER_SCRIPT'
+            cat > $share/bin/beef-ide-launcher << LAUNCHER_SCRIPT
 #!${pkgs.bash}/bin/bash
 set -euo pipefail
-STORE_BIN="${placeholder "out"}/share/beef/bin"
-BEEFLIBS="${placeholder "out"}/share/beef/BeefLibs"
-USER_BEEF_DIR="''${XDG_DATA_HOME:-$HOME/.local/share}/beef"
-VERSION_FILE="$USER_BEEF_DIR/bin/.store-path"
-if [ ! -f "$VERSION_FILE" ] || [ "$(cat "$VERSION_FILE")" != "$STORE_BIN" ]; then
-    mkdir -p "$USER_BEEF_DIR/bin"
-    cp "$STORE_BIN/BeefIDE" "$USER_BEEF_DIR/bin/BeefIDE"
-    chmod u+w "$USER_BEEF_DIR/bin/BeefIDE"
-    for f in "$STORE_BIN"/*; do
-        name="$(basename "$f")"
-        [ "$name" = "BeefIDE" ] && continue
-        ln -sf "$f" "$USER_BEEF_DIR/bin/$name"
+STORE_BIN="$share/bin"
+BEEFLIBS="$share/BeefLibs"
+USER_BEEF_DIR="\''${XDG_DATA_HOME:-\$HOME/.local/share}/beef"
+VERSION_FILE="\$USER_BEEF_DIR/bin/.store-path"
+if [ ! -f "\$VERSION_FILE" ] || [ "\$(cat "\$VERSION_FILE")" != "\$STORE_BIN" ]; then
+    mkdir -p "\$USER_BEEF_DIR/bin"
+    cp "\$STORE_BIN/BeefIDE" "\$USER_BEEF_DIR/bin/BeefIDE"
+    chmod u+w "\$USER_BEEF_DIR/bin/BeefIDE"
+    for f in "\$STORE_BIN"/*; do
+        name="\$(basename "\$f")"
+        [ "\$name" = "BeefIDE" ] && continue
+        ln -sf "\$f" "\$USER_BEEF_DIR/bin/\$name"
     done
-    ln -sfn "$BEEFLIBS" "$USER_BEEF_DIR/BeefLibs"
-    echo "$STORE_BIN" > "$VERSION_FILE"
+    ln -sfn "\$BEEFLIBS" "\$USER_BEEF_DIR/BeefLibs"
+    echo "\$STORE_BIN" > "\$VERSION_FILE"
 fi
-
-# SDL 3.4.x falls back to XWayland on certain Wayland compositors because
-# they do not advertise fifo-v1. BeefIDE's SDL popups have significant UI
-# lag through XWayland, while native Wayland works correctly. The list of
-# affected compositors lives in `waylandOnlyCompositors` in the `let` block
-# above; add a compositor there to force Wayland for it too.
-#
-# XDG_CURRENT_DESKTOP can be a colon-separated list (per the spec), and
-# XDG_SESSION_DESKTOP is checked as a fallback. Matching is case-insensitive
-# (via bash lowercasing) and against whole colon-delimited tokens.
-# Respect an explicit user override of SDL_VIDEODRIVER.
-if [ -z "''${SDL_VIDEODRIVER:-}" ]; then
-    _beef_desktop=":''${XDG_CURRENT_DESKTOP:-}:''${XDG_SESSION_DESKTOP:-}:"
-    case "''${_beef_desktop,,}" in
-        ${waylandCompositorPattern})
-            export SDL_VIDEODRIVER=wayland
-            ;;
-    esac
-fi
-
-exec "$USER_BEEF_DIR/bin/BeefIDE" "$@"
+exec "\$USER_BEEF_DIR/bin/BeefIDE" "\$@"
 LAUNCHER_SCRIPT
             chmod +x $share/bin/beef-ide-launcher
 
             makeWrapper $share/bin/beef-ide-launcher $out/bin/BeefIDE \
               --prefix LD_LIBRARY_PATH : "$libpath" \
-              --prefix LIBRARY_PATH : "$libpath" \
-              --prefix PATH : "${llvmPkgs.clang}/bin" \
-              --prefix PATH : "${llvmPkgs.lld}/bin" \
-              --prefix PATH : "${llvmPkgs.llvm}/bin" \
-              --prefix PATH : "${pkgs.stdenv.cc}/bin" \
               --prefix PATH : "${pkgs.gdb}/bin" \
               --prefix PATH : "${llvmPkgs.lldb}/bin"
 
@@ -384,12 +336,12 @@ LAUNCHER_SCRIPT
           inputsFrom = [ beef ];
           packages = with pkgs; [
             gdb
-            clang-tools
+            llvmPkgs.clang-tools
+            llvmPkgs.clang
           ];
           shellHook = ''
             export LLVM_DIR=${llvmPkgs.llvm.dev}/lib/cmake/llvm
-            echo "Beef dev shell ready (flake packaging)."
-            echo "Build: nix build .#beef   |   Run IDE: nix run .#BeefIDE"
+            echo "Beef dev shell ready. Run: ./Beef/bin/build.sh ide"
           '';
         };
       });
